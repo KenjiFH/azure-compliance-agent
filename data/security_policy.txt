@@ -1,0 +1,10 @@
+# Company Security & Vendor Compliance Policy (v2026)
+
+1. Data Privacy & Compliance
+All third-party vendors handling personally identifiable information (PII) must maintain active SOC 2 Type II compliance. Vendors processing European data must explicitly sign a GDPR Data Processing Agreement (DPA). 
+
+2. Financial Liability Caps
+The maximum acceptable financial liability cap for software vendors is $5,000,000. Any contract proposing a liability cap lower than this threshold must be flagged as a critical violation and escalated to the Legal team immediately.
+
+3. Cloud Hosting & Encryption
+Customer data must be hosted exclusively in the US-East-2 or US-West-2 regions. Multi-tenant databases are permitted only if they utilize strict row-level encryption.

@@ -1,0 +1,84 @@
+# -------------------------------------------------------------------
+# System & OS Files
+# -------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# -------------------------------------------------------------------
+# IDEs & Code Editors
+# -------------------------------------------------------------------
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# -------------------------------------------------------------------
+# Dependencies & Package Managers
+# -------------------------------------------------------------------
+node_modules/
+jspm_packages/
+web_modules/
+.pnpm-store/
+.yarn/
+vendor/
+.venv/
+venv/
+env/
+lib/
+lib64/
+
+# -------------------------------------------------------------------
+# Build Outputs, Distribution & Cache
+# -------------------------------------------------------------------
+dist/
+build/
+out/
+target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.class
+*.pyc
+*.pyo
+.cache/
+.parcel-cache/
+.eslintcache
+.next/
+.nuxt/
+
+# -------------------------------------------------------------------
+# Logs, Debugging & Storage
+# -------------------------------------------------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pids
+*.pid
+*.seed
+*.pid.lock
+db.sqlite3
+
+# -------------------------------------------------------------------
+# Environment Variables & Secrets (CRITICAL)
+# -------------------------------------------------------------------
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+*.pem
+*.key
+*.cert
