@@ -8,7 +8,7 @@ from document_parser import extract_clean_text
 import asyncio  # <-- ADDED to address race condidtions
 import time    # <-- ADDED to address race condidtions and for garbage collection
 
-from tools import escalate_to_slack, create_trello_card
+from tools import escalate_to_slack, create_trello_card, create_jira_ticket
 
 
 from langchain_core.runnables.config import RunnableConfig
@@ -107,6 +107,9 @@ def process_slack_file_background(file_url: str, channel_id: str, thread_ts: str
                 })
                 create_trello_card.invoke({
                     "vendor_name": vendor_name, 
+                    "violation_summary": final_report
+                })
+                create_jira_ticket.invoke({
                     "violation_summary": final_report
                 })
                 

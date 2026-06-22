@@ -3,6 +3,11 @@ import requests
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 
+
+
+from requests.auth import HTTPBasicAuth
+
+
 # Fail Fast: Load environment variables immediately
 if not load_dotenv():
     print("Warning: Could not locate or load the .env file.")
@@ -99,6 +104,54 @@ def create_trello_card(vendor_name: str, violation_summary: str) -> str:
         return f"Success: Trello card created at {card_url}"
     except Exception as e:
         return f"Failed to create Trello card: {str(e)}"
+    
+
+
+@tool
+def create_jira_ticket(violation_summary: str) -> str:
+    """
+    Creates a high-priority Jira task for the Engineering/DevOps team 
+    when a critical vendor compliance violation is flagged.
+    """
+    # 1. Pull credentials from your local .env file
+    domain = os.getenv("JIRA_DOMAIN")  # e.g., https://your-company.atlassian.net
+    email = os.getenv("JIRA_EMAIL")
+    api_token = os.getenv("JIRA_API_TOKEN")
+    project_key = os.getenv("JIRA_PROJECT_KEY")  # e.g., DEV or COMP
+
+    url = f"{domain}/rest/api/2/issue"
+    
+    # 2. Authenticate using HTTPBasicAuth
+    auth = HTTPBasicAuth(email, api_token)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    
+    # 3. Construct the JSON Payload
+    payload = {
+        "fields": {
+            "project": {
+                "key": project_key
+            },
+            "summary": "🚨 Action Required: Vendor Compliance Violation",
+            "description": f"The LangGraph Agent has flagged the following issues that require immediate mitigation:\n\n{violation_summary}",
+            "issuetype": {
+                "name": "Task" 
+            }
+        }
+    }
+    
+    # 4. Fire the request
+    try:
+        response = requests.post(url, json=payload, headers=headers, auth=auth)
+        if response.status_code == 201:
+            issue_key = response.json().get("key")
+            return f"Successfully created Jira ticket: {domain}/browse/{issue_key}"
+        else:
+            return f"Failed to create ticket. Status: {response.status_code}, Error: {response.text}"
+    except Exception as e:
+        return f"Error connecting to Jira API: {str(e)}"
 
 
 # Export the tools as a list so they can be easily bound to the LLM in LangGraph
