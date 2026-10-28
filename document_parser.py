@@ -3,10 +3,9 @@ from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 
-# Fail Fast: Ensure environment is loaded
+# In containers there is no .env file; config comes from real environment variables.
 if not load_dotenv():
-    print("Error: Could not locate or load the .env file.")
-    exit(1)
+    print("Warning: Could not locate or load the .env file.")
 
 def get_doc_intel_client() -> DocumentIntelligenceClient:
     """Initializes the Azure Document Intelligence Client."""
