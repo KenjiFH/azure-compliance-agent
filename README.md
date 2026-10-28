@@ -6,7 +6,7 @@ Slack-triggered vendor contract compliance agent. Uploading a PDF contract to Sl
 
 ![Azure architecture](architecture/azure-architecture.png)
 
-Interactive version: [`architecture/azure-architecture.html`](architecture/azure-architecture.html) (open in a browser). Earlier diagrams are kept in `architecture/v1.png` (original target design) and `architecture/v2.png` (local PoC).
+Interactive version: [open the diagram](https://kenjifh.github.io/compliance_agent_poc/architecture.html) (served by GitHub Pages from `docs/architecture.html`). Earlier diagrams are kept in `architecture/v1.png` (original target design) and `architecture/v2.png` (local PoC).
 
 1. Slack posts a file event to FastAPI (`POST /slack/events`).
 2. The API returns `200` immediately and processes in a background task.
@@ -46,7 +46,8 @@ Escalation tools are invoked deterministically in Python when the scorecard cont
 | `Dockerfile`, `.dockerignore` | Container image for Azure Container Apps |
 | `data/` | Company policy source files |
 | `vendor_example/` | Sample MSA PDF for local parser tests |
-| `architecture/` | Diagrams (generated with the Archify skill in `.claude/skills/archify`) |
+| `architecture/` | Static diagram images |
+| `docs/` | Interactive architecture diagram published via GitHub Pages (generated with the Archify skill) |
 
 ## Prerequisites
 
