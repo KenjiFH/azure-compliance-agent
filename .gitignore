@@ -82,3 +82,7 @@ db.sqlite3
 *.pem
 *.key
 *.cert
+
+# Archify skill and its scratch output
+.archify/
+.claude/skills/
