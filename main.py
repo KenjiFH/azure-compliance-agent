@@ -11,8 +11,8 @@ from models import Review
 from review import router as review_router, make_review_url
 import storage
 import uuid
-import asyncio  # <-- ADDED to address race condidtions
-import time    # <-- ADDED to address race condidtions and for garbage collection
+import dedup  # Redis-backed idempotency (SET NX EX), shared across replicas
+from starlette.concurrency import run_in_threadpool
 
 from tools import escalate_to_slack, create_trello_card, create_jira_ticket
 
@@ -28,11 +28,6 @@ load_dotenv()
 app = FastAPI(title="Logic20/20 Compliance Agent")
 app.include_router(review_router)
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-
-# Replace processed_files = set() with a dictionary
-processed_files = {}
-file_lock = asyncio.Lock()
-TTL_SECONDS = 300  # 5 minutes is plenty of time to stop Slack retries
 
 def build_review(parsed, pdf_bytes: bytes, vendor: str, contract_text: str, report: str):
     """Extract findings, locate them in the PDF, persist PDF+review. Returns (url, findings)."""
@@ -53,7 +48,7 @@ def review_url_footer(url: str, findings) -> str:
     return "\n".join(lines)
 
 
-def process_slack_file_background(file_url: str, channel_id: str, thread_ts: str):
+def process_slack_file_background(file_url: str, channel_id: str, thread_ts: str, file_id: str):
     """
     Background worker with Enterprise UX State Management (Thinking -> Update).
     """
@@ -184,9 +179,14 @@ def process_slack_file_background(file_url: str, channel_id: str, thread_ts: str
             requests.post("https://slack.com/api/chat.postMessage", headers=headers, json=fallback_payload)
             
         print("✅ Success: Workflow complete.\n")
+        if extraction_failed:
+            dedup.release(file_id)   # nothing was escalated; allow a retry
+        else:
+            dedup.mark_done(file_id)
 
     except Exception as e:
         print(f"❌ Background Processing Error: {str(e)}")
+        dedup.release(file_id)   # let a retry or re-delivery of this file run again
         # Gracefully handle the error in Slack so the user isn't stuck waiting forever
         if thinking_ts:
             error_payload = {
@@ -212,41 +212,16 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
         return {"status": "ignored", "reason": "Bot message"}
 
   
-  # --- 3. ASSET-BASED IDEMPOTENCY GUARDRAIL (WITH TTL CACHE) ---
-    files = event.get("files", [])
-    if files:
-        file_id = files[0].get("id")
-        current_time = time.time()
-        
-        async with file_lock:
-            # A. GARBAGE COLLECTION: Clean up memory so the server never crashes
-            # We use list() to avoid a "dictionary changed size during iteration" error
-            for key in list(processed_files.keys()):
-                if current_time - processed_files[key] > TTL_SECONDS:
-                    del processed_files[key]
-
-            # B. IDEMPOTENCY CHECK
-            if file_id in processed_files:
-                print(f"🛑 Overlapping Slack event ignored. Already processing file: {file_id}")
-                return {"status": "ignored", "reason": "redundant file event"}
-                
-            # C. REGISTER THE FILE WITH A TIMESTAMP
-            processed_files[file_id] = current_time
-            
-        file_url = files[0].get("url_private_download")
-        channel_id = event.get("channel") or event.get("channel_id")
-        thread_ts = event.get("thread_ts") or event.get("ts")
-        print("File detected! Instantly returning 200 OK and routing to background task...")
-        background_tasks.add_task(process_slack_file_background, file_url, channel_id, thread_ts)
-        return {"status": "processing"}
-
-    if payload.get("type") == "url_verification":
-        return {"challenge": payload.get("challenge")}
-
-    event = payload.get("event", {})
-
-    if event.get("bot_id"):
-        return {"status": "ignored", "reason": "Bot message"}
+    # --- 3. IDEMPOTENCY: every route below claims the file in Redis before doing any work ---
+    # Slack retries events and sends several for one upload (`message` + `file_shared`),
+    # so all of them are keyed on the same file ID. SET NX EX is atomic across replicas.
+    async def claim(file_id):
+        if not file_id:
+            return True   # nothing to key on; fall through
+        if await run_in_threadpool(dedup.claim, file_id):
+            return True
+        print(f"🛑 Duplicate Slack event ignored. Already handled file: {file_id}")
+        return False
 
     event_type = event.get("type")
 
@@ -256,6 +231,9 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
         channel_id = event.get("channel_id")  # note: file_shared uses channel_id not channel
 
         if file_id and channel_id:
+            if not await claim(file_id):
+                return {"status": "ignored", "reason": "redundant file event"}
+
             # Fetch full file info from Slack API
             headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
             file_info_resp = requests.get(
@@ -270,14 +248,15 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
             if file_url:
                 print("File detected via file_shared! Routing to background task...")
                 background_tasks.add_task(
-                    process_slack_file_background, file_url, channel_id, thread_ts
+                    process_slack_file_background, file_url, channel_id, thread_ts, file_id
                 )
                 return {"status": "processing"}
+            dedup.release(file_id)   # claimed but nothing to process
 
     # Handle app_mention and message events (with file already embedded)
     if event_type in ["app_mention", "message"]:
         files = event.get("files", [])
-        channel_id = event.get("channel")
+        channel_id = event.get("channel") or event.get("channel_id")
         thread_ts = event.get("thread_ts") or event.get("ts")
 
         # Respond to plain @mentions so users know the bot is alive
@@ -295,12 +274,15 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
                 )
             return {"status": "ignored", "reason": "No file attached"}
 
+        file_id = files[0].get("id")
         file_url = files[0].get("url_private_download")
         if file_url:
+            if not await claim(file_id):
+                return {"status": "ignored", "reason": "redundant file event"}
             print("File detected via message! Routing to background task...")
             background_tasks.add_task(
-                process_slack_file_background, file_url, channel_id, thread_ts
+                process_slack_file_background, file_url, channel_id, thread_ts, file_id
             )
             return {"status": "processing"}
 
-    return {"status": "ok"}
+    return {"status": "ignored"}

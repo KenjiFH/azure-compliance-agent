@@ -67,3 +67,4 @@ uvicorn==0.30.6
 yarl==1.24.2
 azure-storage-blob==12.23.1
 rapidfuzz==3.10.1
+redis==5.0.8

@@ -7,11 +7,11 @@ Slack-triggered vendor contract compliance agent. Uploading a PDF contract to Sl
 ![Azure architecture](architecture/azure-architecture.png)
 
 
-Interactive version: [open the diagram](https://kenjifh.github.io/azure-compliance-agent/) (served by GitHub Pages from `docs/architecture.html`). Earlier diagrams are kept in `architecture/v1.png` (original target design) and `architecture/v2.png` (local PoC).
+Interactive version: [open the diagram](https://kenjifh.github.io/azure-compliance-agent/) (served by GitHub Pages from `docs/index.html`). Earlier diagrams are kept in `architecture/v1.png` (original target design) and `architecture/v2.png` (local PoC).
 
 
 1. Slack posts a file event to FastAPI (`POST /slack/events`).
-2. The API returns `200` immediately and processes in a background task.
+2. The API claims the file in Azure Cache for Redis (`SET slack:file:<file_id> NX EX`). Duplicates (Slack retries, or `message` + `file_shared` for the same upload) lose the claim and are ignored. The winner gets `200` immediately and is processed in a background task.
 3. Azure Document Intelligence (`prebuilt-read`) extracts the text plus per-line page numbers, character offsets and bounding polygons. Only the text goes to the LLM; the geometry stays server-side.
 4. A LangGraph ReAct agent (Azure OpenAI) reviews the text against company policies retrieved from Azure AI Search and a liability calculator.
 5. A second structured LLM pass (`extract_findings`) turns the report into discrete findings, each with a **verbatim quote** from the contract (never coordinates).
@@ -26,7 +26,7 @@ Policy documents in `data/` are indexed into Azure AI Search by `ingest_policies
 
 ```
 Slack PDF upload
-  → FastAPI webhook (idempotent, <3s ACK)
+  → FastAPI webhook (<3s ACK; file_id claimed in Redis via SET NX EX, duplicates ignored)
   → Background task: download PDF
   → Azure Document Intelligence (prebuilt-read: text + line polygons)
   → LangGraph agent (Azure OpenAI)
@@ -40,6 +40,23 @@ Slack PDF upload
   → Human review page (/reviews/{id}): highlighted PDF, confirm / dismiss
 ```
 
+## Idempotent webhook
+
+Slack retries events it doesn't get a fast `200` for, and one upload can fire several events (`message`, `app_mention`, `file_shared`). Every route in `/slack/events` therefore claims the file in Redis before doing any work (`dedup.py`):
+
+| Step | Redis operation | Key state |
+|------|-----------------|-----------|
+| Event arrives | `SET slack:file:<file_id> processing NX EX 900` (atomic; only one caller wins) | `processing` |
+| Worker finishes | `SET slack:file:<file_id> done EX 86400` | `done` (late retries stay ignored for 24 h) |
+| Worker fails or extraction fails | `DEL slack:file:<file_id>` | free, so a retry can run |
+| Worker crashes | key expires after 15 min | free |
+
+- Because the claim lives in Redis rather than process memory, it holds across restarts and across replicas.
+- Redis failures **fail open**: if `REDIS_URL` is unset (local dev) or the cache is unreachable, `dedup.py` logs a warning and uses a per-process in-memory guard, so uploads are never dropped because of a cache outage. In that mode dedup is per replica again.
+- TTLs are tunable with `DEDUP_PROCESSING_TTL` and `DEDUP_DONE_TTL` (seconds).
+- Tested in `tests/test_dedup.py` (first claim wins, 20-way concurrent race, release, expiry, Redis outage).
+- Not covered: the Trello/Jira/Slack-webhook calls have no per-step idempotency, so a crash midway through escalation is not resumed.
+
 Escalation tools are invoked deterministically in Python when the scorecard contains `action required` or `🚨`, not by the LLM. The agent only uses the policy retriever and liability calculator.
 
 ## Project layout
@@ -47,13 +64,14 @@ Escalation tools are invoked deterministically in Python when the scorecard cont
 | Path | Role |
 |------|------|
 | `main.py` | FastAPI app, Slack webhook, background processing, routing |
+| `dedup.py` | Redis-backed idempotency guard for Slack events (`SET NX EX`, in-memory fallback) |
 | `agent.py` | LangGraph ReAct agent + system prompt; `extract_findings` structured pass |
 | `models.py` | Pydantic models: parsed document, findings, review |
 | `locator.py` | Resolves a verbatim quote to page, char range and bounding boxes |
 | `storage.py` | Azure Blob persistence for the PDF and `review.json` |
 | `review.py` | Review endpoints, HMAC-signed links, approve/dismiss |
 | `static/review.html` | Review viewer (PDF.js + highlight overlay) |
-| `tests/` | pytest tests for the locator |
+| `tests/` | pytest tests for the locator and the dedup guard |
 | `tools.py` | Liability calc, Slack/Trello/Jira escalation helpers |
 | `ingestion.py` | Azure AI Search vector store + document loading/chunking helpers |
 | `ingest_policies.py` | Loads `data/*.txt` into the Azure AI Search index (re-run when policies change) |
@@ -72,6 +90,7 @@ Escalation tools are invoked deterministically in Python when the scorecard cont
 - Azure AI Document Intelligence
 - Azure AI Search
 - Azure Storage account (Blob) for PDFs and review data
+- Azure Cache for Redis (Slack event dedup); optional locally, where it falls back to in-memory
 - Docker and Azure CLI (for deployment)
 - Slack app (bot token, Events API pointing at `/slack/events`, optional incoming webhook)
 - Optional: Trello API credentials, Jira Cloud API token
@@ -113,6 +132,11 @@ PUBLIC_BASE_URL=            # public URL of this service, e.g. https://<app>.azu
 AZURE_STORAGE_CONNECTION_STRING=   # local/Azurite; or use the account URL below with managed identity
 AZURE_STORAGE_ACCOUNT_URL=         # https://<account>.blob.core.windows.net
 REVIEW_CONTAINER=reviews           # optional, blob container name
+
+# Redis (Slack event idempotency; omit locally to use the in-memory fallback)
+REDIS_URL=                  # rediss://:<access-key>@<name>.redis.cache.windows.net:6380/0
+DEDUP_PROCESSING_TTL=900    # optional, seconds
+DEDUP_DONE_TTL=86400        # optional, seconds
 
 # Slack
 SLACK_BOT_TOKEN=
@@ -171,7 +195,7 @@ Subscribe to `file_shared`, `message.channels` / `app_mention` as needed. Upload
 python test_connection.py   # Azure OpenAI handshake
 python ingestion.py         # Query the AI Search index with a sample policy question
 python document_parser.py   # OCR sample PDF under vendor_example/ (prints page/line counts)
-pytest tests                # locator unit tests (no Azure needed)
+pytest tests                # locator + dedup unit tests (no Azure needed)
 python tools.py             # Fire Slack/Trello test payloads
 ```
 
@@ -190,10 +214,32 @@ az containerapp update -g rg-west-deployments-kenji -n compliance-agent \
 
 - API keys, tokens and webhook URLs are stored as Container Apps secrets and exposed to the app as env vars (`secretref:`); endpoints and deployment names are plain env vars.
 - Grant the app's managed identity **Storage Blob Data Contributor** on the storage account and set `AZURE_STORAGE_ACCOUNT_URL`, `REVIEW_LINK_SECRET` and `PUBLIC_BASE_URL`.
-- Keep `--max-replicas 1`: file-ID dedup is in-memory, so more replicas would process Slack retries twice.
+- Slack event dedup lives in Azure Cache for Redis (see below), so it no longer depends on a single replica. The app is still deployed with one replica; raising `--max-replicas` is safe for dedup, but the Redis URL must be set or each replica falls back to its own in-memory guard.
 - The container has no `.env` file; `load_dotenv()` only warns and configuration comes from the environment.
 - The `gpt-4o-deploy` deployment name in Azure OpenAI currently points at a **gpt-5.1** model (gpt-4o had no quota); the name is kept so no app config changes.
 - Document Intelligence is on the free F0 tier, which analyses only the first 2 pages of each PDF. Use S0 for full contracts.
+
+### Redis (Slack dedup)
+
+Created once with the Azure CLI (Basic C0 is the cheapest tier; use Standard for a replica). The first command is only needed if `Microsoft.Cache` isn't registered in the subscription yet:
+
+```bash
+az provider register -n Microsoft.Cache --wait
+
+az redis create -g rg-west-deployments-kenji -n kenjif-compliance-redis -l westus \
+  --sku Basic --vm-size c0 --minimum-tls-version 1.2      # takes ~15-20 min
+
+# Build the connection string and store it as a Container Apps secret
+KEY=$(az redis list-keys -g rg-west-deployments-kenji -n kenjif-compliance-redis --query primaryKey -o tsv)
+az containerapp secret set -g rg-west-deployments-kenji -n compliance-agent \
+  --secrets redis-url="rediss://:${KEY}@kenjif-compliance-redis.redis.cache.windows.net:6380/0"
+az containerapp update -g rg-west-deployments-kenji -n compliance-agent \
+  --set-env-vars REDIS_URL=secretref:redis-url
+```
+
+- TLS only (port 6380); the non-TLS port is disabled by default. The connection string uses an access key, so rotate it with `az redis regenerate-keys` and re-run `az containerapp secret set`.
+- Verify: `az redis show -g rg-west-deployments-kenji -n kenjif-compliance-redis --query provisioningState` should be `Succeeded`, and the app logs `🛑 Duplicate Slack event ignored` when the same upload is delivered twice.
+- Azure Cache for Redis is Microsoft's older Redis offering; Azure Managed Redis is the successor. The app only needs standard Redis commands, so switching is just a new `REDIS_URL`.
 
 ### Rollback strategies
 
@@ -204,7 +250,7 @@ Always build to a **new, immutable tag** (`v3`, `v4`, ...) and never overwrite o
    az containerapp update -g rg-west-deployments-kenji -n compliance-agent \
      --image myacrreg.azurecr.io/compliance-agent:v2
    ```
-   Note `v2` predates the Blob/OCR review code, so the review viewer endpoints and Blob persistence are absent after rolling back to it.
+   Note `v2` predates the Blob/OCR review code, so the review viewer endpoints and Blob persistence are absent after rolling back to it. Images before `v4` also predate the Redis dedup: they ignore `REDIS_URL` and use the in-memory guard, so keep `--max-replicas 1` if you roll back past `v4`.
 2. **Roll back to a previous revision.** Each update creates a revision; list them and reactivate an earlier one:
    ```bash
    az containerapp revision list -g rg-west-deployments-kenji -n compliance-agent -o table
@@ -239,6 +285,6 @@ Verify after any rollback: the active revision is `Healthy`/`Running` (`az conta
 
 - The `/slack/events` endpoint does not yet verify Slack request signatures (`SLACK_SIGNING_SECRET` is configured but unused); add this before relying on it publicly.
 - Bot messages are ignored to avoid reply loops.
-- File IDs are cached ~5 minutes to suppress Slack retry duplicates.
+- Slack retry duplicates are suppressed by a Redis claim per file ID (15 min while processing, 24 h once done; see [Idempotent webhook](#idempotent-webhook)). If Redis is down the app fails open to an in-memory guard.
 - Background failures update the Slack “thinking” message with an error string.
 - LangSmith run metadata tags Slack channel / thread when tracing is enabled.
