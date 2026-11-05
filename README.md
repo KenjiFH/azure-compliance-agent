@@ -6,7 +6,7 @@ Slack-triggered vendor contract compliance agent. Uploading a PDF contract to Sl
 
 ![Azure architecture](architecture/azure-architecture.png)
 
-Interactive version: [open the diagram](https://kenjifh.github.io/compliance_agent_poc/architecture.html) (served by GitHub Pages from `docs/architecture.html`). Earlier diagrams are kept in `architecture/v1.png` (original target design) and `architecture/v2.png` (local PoC).
+Interactive version: [open the diagram](https://kenjifh.github.io/azure-compliance-agent/) (served by GitHub Pages from `docs/architecture.html`). Earlier diagrams are kept in `architecture/v1.png` (original target design) and `architecture/v2.png` (local PoC).
 
 1. Slack posts a file event to FastAPI (`POST /slack/events`).
 2. The API returns `200` immediately and processes in a background task.
