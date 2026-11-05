@@ -181,11 +181,11 @@ The app runs as a single-replica Azure Container App in resource group `rg-west-
 
 ```bash
 # Build the image in ACR
-az acr build -r myacrreg -g rg-west-deployments-kenji -t compliance-agent:v2 .
+az acr build -r myacrreg -g rg-west-deployments-kenji -t compliance-agent:v3 .
 
 # Roll out a new version
 az containerapp update -g rg-west-deployments-kenji -n compliance-agent \
-  --image myacrreg.azurecr.io/compliance-agent:v2
+  --image myacrreg.azurecr.io/compliance-agent:v3
 ```
 
 - API keys, tokens and webhook URLs are stored as Container Apps secrets and exposed to the app as env vars (`secretref:`); endpoints and deployment names are plain env vars.
@@ -194,6 +194,33 @@ az containerapp update -g rg-west-deployments-kenji -n compliance-agent \
 - The container has no `.env` file; `load_dotenv()` only warns and configuration comes from the environment.
 - The `gpt-4o-deploy` deployment name in Azure OpenAI currently points at a **gpt-5.1** model (gpt-4o had no quota); the name is kept so no app config changes.
 - Document Intelligence is on the free F0 tier, which analyses only the first 2 pages of each PDF. Use S0 for full contracts.
+
+### Rollback strategies
+
+Always build to a **new, immutable tag** (`v3`, `v4`, ...) and never overwrite one, so every previous image stays in ACR and can be redeployed. Tags currently in the registry: `v1`, `v2`, `v3` (`az acr repository show-tags -n myacrreg --repository compliance-agent -o tsv`).
+
+1. **Roll back the image (default).** Point the app at the last known-good tag:
+   ```bash
+   az containerapp update -g rg-west-deployments-kenji -n compliance-agent \
+     --image myacrreg.azurecr.io/compliance-agent:v2
+   ```
+   Note `v2` predates the Blob/OCR review code, so the review viewer endpoints and Blob persistence are absent after rolling back to it.
+2. **Roll back to a previous revision.** Each update creates a revision; list them and reactivate an earlier one:
+   ```bash
+   az containerapp revision list -g rg-west-deployments-kenji -n compliance-agent -o table
+   az containerapp revision activate -g rg-west-deployments-kenji -n compliance-agent --revision <name>
+   ```
+   In single-revision mode the previous revision is deactivated after an update, and a revision keeps its own env and secret references, so check config before relying on this. Prefer option 1.
+3. **Roll back a config or secret change.** Env var changes also create a revision. Re-run `az containerapp update --set-env-vars ...` (or `az containerapp secret set`) with the old value, then restart the revision. Rotating `REVIEW_LINK_SECRET` invalidates all previously issued review links.
+4. **Roll back data.** Blob data is not rolled back by an image rollback. `review.json` and PDFs in the `reviews` container stay as written, so an older image may not understand newer review JSON. Enable blob versioning and soft delete to make data recoverable:
+   ```bash
+   az storage account blob-service-properties update -g rg-west-deployments-kenji \
+     --account-name kenjifcomplianceblob --enable-versioning true \
+     --enable-delete-retention true --delete-retention-days 7
+   ```
+5. **AI Search index.** `ingest_policies.py` upserts chunks by content hash and never deletes, so re-running it from an older commit restores old text but leaves chunks from newer policies in the index. To fully revert, delete the index (or the unwanted documents) in the portal first, then re-run it from the desired commit. Keep `data/*.txt` in git.
+
+Verify after any rollback: the active revision is `Healthy`/`Running` (`az containerapp revision list`) and `GET /docs` returns 200.
 
 ## Agent behavior
 
