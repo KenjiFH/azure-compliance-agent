@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compliance Review</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --text:#1c1f23; --muted:#667; --line:#dde1e6; --hl:rgba(255,200,0,.4); --hlb:#e6a800; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --panel:#1d2026; --text:#e8eaed; --muted:#99a; --line:#333842; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--text); display:flex; height:100vh; }
+  #side { width:360px; overflow:auto; padding:16px; border-right:1px solid var(--line); background:var(--panel); }
+  #viewer { flex:1; overflow:auto; padding:16px; }
+  .page { position:relative; margin:0 auto 16px; box-shadow:0 1px 6px rgba(0,0,0,.25); width:fit-content; }
+  .page canvas { display:block; }
+  .hl { position:absolute; background:var(--hl); outline:2px solid var(--hlb); pointer-events:none; }
+  .hl.active { background:rgba(255,120,0,.45); outline-color:#ff6a00; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px; cursor:pointer; }
+  .card.active { border-color:#ff6a00; }
+  .sev { font-size:11px; font-weight:600; text-transform:uppercase; padding:1px 6px; border-radius:4px; background:var(--line); }
+  .sev.high { background:#e5484d; color:#fff; } .sev.medium { background:#f5a524; color:#000; }
+  blockquote { margin:8px 0; padding-left:8px; border-left:3px solid var(--hlb); color:var(--muted); }
+  button { padding:4px 10px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); cursor:pointer; }
+  button.on-approved { background:#2e9e5b; color:#fff; } button.on-rejected { background:#e5484d; color:#fff; }
+  .warn { color:#e5484d; font-size:12px; }
+  @media (max-width:800px) { body { flex-direction:column; height:auto; } #side { width:100%; } }
+</style>
+</head>
+<body>
+<div id="side"><h2 id="title">Loading…</h2><div id="list"></div></div>
+<div id="viewer"></div>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const base = location.pathname.replace(/\/$/, "");
+const qs = location.search;
+const SCALE = 1.4;
+let review, pageEls = {}, hlEls = {}, active = null;
+
+const esc = s => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function init() {
+  review = await (await fetch(`${base}/data${qs}`)).json();
+  document.getElementById("title").textContent = `Review: ${review.vendor}`;
+  const pdf = await pdfjsLib.getDocument(`${base}/pdf${qs}`).promise;
+  const viewer = document.getElementById("viewer");
+  for (let n = 1; n <= pdf.numPages; n++) {
+    const page = await pdf.getPage(n);
+    const vp = page.getViewport({ scale: SCALE });
+    const div = document.createElement("div"); div.className = "page";
+    const canvas = document.createElement("canvas");
+    canvas.width = vp.width; canvas.height = vp.height;
+    div.appendChild(canvas); viewer.appendChild(div); pageEls[n] = div;
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+  }
+  drawHighlights();
+  renderList();
+}
+
+// Azure polygons are in page units (inches for PDFs); scale to rendered pixels via page width.
+function drawHighlights() {
+  for (const f of review.findings) {
+    hlEls[f.id] = [];
+    for (const b of f.boxes) {
+      const pg = review.pages.find(p => p.page_number === b.page);
+      const div = pageEls[b.page]; if (!pg || !div) continue;
+      const k = div.firstChild.width / pg.width;
+      const xs = b.polygon.filter((_, i) => i % 2 === 0), ys = b.polygon.filter((_, i) => i % 2 === 1);
+      const el = document.createElement("div"); el.className = "hl";
+      Object.assign(el.style, { left: Math.min(...xs)*k+"px", top: Math.min(...ys)*k+"px",
+        width: (Math.max(...xs)-Math.min(...xs))*k+"px", height: (Math.max(...ys)-Math.min(...ys))*k+"px" });
+      div.appendChild(el); hlEls[f.id].push(el);
+    }
+  }
+}
+
+function renderList() {
+  const list = document.getElementById("list"); list.innerHTML = "";
+  for (const f of review.findings) {
+    const c = document.createElement("div");
+    c.className = "card" + (active === f.id ? " active" : "");
+    c.innerHTML = `<span class="sev ${f.severity}">${f.severity}</span> <b>${esc(f.policy_rule)}</b>
+      <div>${esc(f.description)}</div>
+      <blockquote>${esc(f.quote)}</blockquote>
+      <div>${f.located ? `Page ${f.page}` : '<span class="warn">⚠ Could not locate in document — search manually</span>'}</div>
+      <div style="margin-top:6px">
+        <button class="${f.status==='approved'?'on-approved':''}" data-s="approved">Confirm violation</button>
+        <button class="${f.status==='rejected'?'on-rejected':''}" data-s="rejected">Dismiss</button>
+      </div>`;
+    c.onclick = () => focusFinding(f);
+    c.querySelectorAll("button").forEach(btn => btn.onclick = e => { e.stopPropagation(); decide(f, btn.dataset.s); });
+    list.appendChild(c);
+  }
+}
+
+function focusFinding(f) {
+  active = f.id;
+  for (const els of Object.values(hlEls)) els.forEach(e => e.classList.remove("active"));
+  (hlEls[f.id] || []).forEach(e => e.classList.add("active"));
+  if (hlEls[f.id]?.[0]) hlEls[f.id][0].scrollIntoView({ behavior: "smooth", block: "center" });
+  renderList();
+}
+
+async function decide(f, status) {
+  const next = f.status === status ? "pending" : status;
+  const res = await fetch(`${base}/findings/${f.id}${qs}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status: next, note: f.note || "" })
+  });
+  if (res.ok) { f.status = next; renderList(); } else alert("Save failed: " + res.status);
+}
+
+init().catch(e => { document.getElementById("title").textContent = "Failed to load review"; console.error(e); });
+</script>
+</body>
+</html>

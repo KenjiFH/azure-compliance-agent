@@ -1,5 +1,7 @@
 import os
+from typing import List
 from dotenv import load_dotenv
+from models import FindingDraft, FindingList
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import create_react_agent
@@ -63,3 +65,26 @@ def build_agent_executor():
     return agent_executor
 
 app_agent = build_agent_executor()
+
+
+def extract_findings(contract_text: str, report: str) -> List[FindingDraft]:
+    """
+    Second, structured pass: turn the agent's free-text report into discrete findings,
+    each with a VERBATIM quote from the contract. Coordinates are resolved later by locator.py.
+    """
+    llm = AzureChatOpenAI(
+        azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        temperature=0.0,
+    ).with_structured_output(FindingList)
+
+    result = llm.invoke([
+        SystemMessage(content=(
+            "You convert a compliance report into structured findings. Output one finding per "
+            "violation (none if the report says the contract is compliant). For each, `quote` "
+            "MUST be copied character-for-character from the contract text - the shortest clause "
+            "that demonstrates the violation. Never paraphrase."
+        )),
+        ("user", f"CONTRACT:\n{contract_text}\n\nCOMPLIANCE REPORT:\n{report}"),
+    ])
+    return result.findings

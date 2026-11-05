@@ -4,7 +4,13 @@ import tempfile
 from fastapi import FastAPI, BackgroundTasks, Request
 from dotenv import load_dotenv
 from agent import app_agent
-from document_parser import extract_clean_text
+from document_parser import parse_document, ExtractionError
+from agent import extract_findings
+from locator import locate
+from models import Review
+from review import router as review_router, make_review_url
+import storage
+import uuid
 import asyncio  # <-- ADDED to address race condidtions
 import time    # <-- ADDED to address race condidtions and for garbage collection
 
@@ -20,12 +26,32 @@ ls_client = Client()
 load_dotenv()
 
 app = FastAPI(title="Logic20/20 Compliance Agent")
+app.include_router(review_router)
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 
 # Replace processed_files = set() with a dictionary
 processed_files = {}
 file_lock = asyncio.Lock()
 TTL_SECONDS = 300  # 5 minutes is plenty of time to stop Slack retries
+
+def build_review(parsed, pdf_bytes: bytes, vendor: str, contract_text: str, report: str):
+    """Extract findings, locate them in the PDF, persist PDF+review. Returns (url, findings)."""
+    drafts = extract_findings(contract_text, report)
+    findings = [locate(d, parsed, uuid.uuid4().hex[:8]) for d in drafts]
+    review = Review(id=uuid.uuid4().hex, vendor=vendor, pages=parsed.pages, findings=findings)
+    storage.save_pdf(review.id, pdf_bytes)
+    storage.save_review(review)
+    return make_review_url(review.id), findings
+
+
+def review_url_footer(url: str, findings) -> str:
+    lines = ["\n\n*📍 Violation locations (click to review):*"]
+    for f in findings:
+        where = f"p.{f.page}" if f.located else "location not found"
+        lines.append(f"• {f.policy_rule} ({where}): “{f.quote[:140]}”")
+    lines.append(f"<{url}|Open review page>")
+    return "\n".join(lines)
+
 
 def process_slack_file_background(file_url: str, channel_id: str, thread_ts: str):
     """
@@ -59,10 +85,17 @@ def process_slack_file_background(file_url: str, channel_id: str, thread_ts: str
             temp_path = temp_file.name
 
         print("[3/5] Extracting text via Azure Document Intelligence...")
-        contract_text = extract_clean_text(temp_path)
-        os.remove(temp_path) 
+        try:
+            parsed = parse_document(temp_path)
+            contract_text = parsed.content
+            extraction_failed = False
+        except ExtractionError as e:
+            print(f"Extraction error: {e}")
+            extraction_failed = True
+        finally:
+            os.remove(temp_path)
 
-        if "Error" in contract_text:
+        if extraction_failed:
             final_report = "❌ *Extraction Failed:* Azure Document Intelligence could not read this file."
             status_header = ""
         else:
@@ -99,18 +132,28 @@ def process_slack_file_background(file_url: str, channel_id: str, thread_ts: str
                     vendor_name = final_report.split("*Compliance Scorecard: ")[1].split("*")[0]
                 except IndexError:
                     vendor_name = "Unknown Vendor"
-                
+
+                # --- LOCATE VIOLATIONS FOR HUMAN REVIEW ---
+                escalation_text = final_report
+                try:
+                    review_url = build_review(parsed, dl_res.content, vendor_name, contract_text, final_report)
+                    escalation_text = final_report.rstrip() + review_url_footer(review_url[0], review_url[1])
+                    final_report = escalation_text
+                except Exception as e:
+                    # Never block escalation because the review viewer failed
+                    print(f"⚠️ Could not build review page: {e}")
+
                 # Fire the tools manually in pure Python
                 escalate_to_slack.invoke({
-                    "vendor_name": vendor_name, 
-                    "violation_summary": final_report
+                    "vendor_name": vendor_name,
+                    "violation_summary": escalation_text
                 })
                 create_trello_card.invoke({
-                    "vendor_name": vendor_name, 
-                    "violation_summary": final_report
+                    "vendor_name": vendor_name,
+                    "violation_summary": escalation_text
                 })
                 create_jira_ticket.invoke({
-                    "violation_summary": final_report
+                    "violation_summary": escalation_text
                 })
                 
             else:
@@ -190,6 +233,9 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
             # C. REGISTER THE FILE WITH A TIMESTAMP
             processed_files[file_id] = current_time
             
+        file_url = files[0].get("url_private_download")
+        channel_id = event.get("channel") or event.get("channel_id")
+        thread_ts = event.get("thread_ts") or event.get("ts")
         print("File detected! Instantly returning 200 OK and routing to background task...")
         background_tasks.add_task(process_slack_file_background, file_url, channel_id, thread_ts)
         return {"status": "processing"}
